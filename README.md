@@ -23,7 +23,7 @@ cargo add mcp-stdio-rs
 - `McpStdioClient::spawn_with_options(cmd, args, env, options)` allows callers to configure initialization, request, and shutdown deadlines.
 - `client.list_tools()` returns the server's available `ToolDef` values.
 - `client.call_tool(name, args)` sends `tools/call` with JSON arguments and returns `ToolResult`.
-- `client.shutdown()` sends a best-effort shutdown, kills the child process if needed, and joins the stdout reader task.
+- `client.shutdown()` closes the child's stdin, waits `shutdown_grace_period` for it to exit, then sends SIGTERM and waits again before force-killing it, and joins the stdout reader task.
 
 ## Example
 
