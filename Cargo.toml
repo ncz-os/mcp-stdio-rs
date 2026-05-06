@@ -1,0 +1,30 @@
+[package]
+name = "mcp-stdio-rs"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Minimal embeddable Rust MCP stdio client for MNEMOS and compatible servers"
+rust-version = "1.86"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "process", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+default = []
+rmcp-sdk = []
+
+[package.metadata.mcp-stdio-rs.rmcp]
+crate = "rmcp"
+version = "0.16.0"
+features = ["client", "transport-child-process"]
+note = "Verified on crates.io; not linked by default because this crate hand-rolls the requested stdio JSON-RPC surface."
+
+[[bin]]
+name = "mcp-stdio-cli"
+path = "src/bin/mcp-stdio-cli.rs"
