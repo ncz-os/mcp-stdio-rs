@@ -1,0 +1,51 @@
+# ncz-os Rust quality gate (GitLab). gitlab.com is the canonical CI/dev home for
+# ncz-os; github.com/ncz-os/mcp-stdio-rs is a mirror with the matching GitHub gate.
+# GitLab CI is free under the ncz-os OSS license, so this linux gate runs the full
+# zeroclaw-shape battery (fmt, clippy -D warnings, check all/no-default, nextest,
+# cargo-deny). The 3-OS matrix lives in the GitHub gate (gitlab.com shared runners
+# are linux-only). Toolchain pinned to 1.86.
+default:
+  image: rust:1.86
+  cache:
+    key:
+      files: [Cargo.lock]
+    paths: [.cargo/, target/]
+
+variables:
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+stages: [check, test, security]
+
+fmt:
+  stage: check
+  script:
+    - rustup component add rustfmt
+    - cargo fmt --all -- --check
+
+clippy:
+  stage: check
+  script:
+    - rustup component add clippy
+    - cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+check:
+  stage: check
+  script:
+    - cargo check --workspace --locked --all-features
+    - cargo check --workspace --locked --no-default-features
+
+test:
+  stage: test
+  script:
+    - cargo install cargo-nextest --locked || true
+    - cargo nextest run --workspace --locked --all-features
+    - cargo test --workspace --locked --all-features --doc
+
+security:
+  stage: security
+  script:
+    - cargo install cargo-deny --locked || true
+    - cargo deny check
+    - cargo fetch --locked
