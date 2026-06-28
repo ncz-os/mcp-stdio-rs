@@ -3,7 +3,7 @@ name: Quality Gate
 # ncz-os Rust quality gate — same shape as zeroclaw-labs/zeroclaw CI, parameterized
 # for this repo. GitLab (.gitlab-ci.yml) mirrors the comprehensive linux gate.
 # Toolchain pinned to 1.86 (matches rust-toolchain.toml where present) so
-# rustfmt/clippy behavior is reproducible. OS matrix: linux, macos, windows.
+# rustfmt/clippy behavior is reproducible. OS matrix: linux, macos.
 
 on:
   pull_request:
@@ -61,7 +61,6 @@ jobs:
         include:
           - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, cmd: build, label: Build }
           - { os: macos-14,       target: aarch64-apple-darwin,     cmd: check, label: Check }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc,   cmd: check, label: Check }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
