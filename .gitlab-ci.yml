@@ -14,6 +14,7 @@ default:
     paths: [.cargo/, target/]
   before_script:
     - export PATH="$CARGO_HOME/bin:$PATH"
+    - mkdir -p "$CARGO_HOME/bin"
 
 variables:
   CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
