@@ -1,7 +1,6 @@
 # cargo-deny config for the ncz-os Rust quality gate. Schema v2.
 [advisories]
 version = 2
-unmaintained = "workspace"
 ignore = []
 
 [licenses]

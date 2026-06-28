@@ -2,14 +2,18 @@
 # ncz-os; github.com/ncz-os/mcp-stdio-rs is a mirror with the matching GitHub gate.
 # GitLab CI is free under the ncz-os OSS license, so this linux gate runs the full
 # zeroclaw-shape battery (fmt, clippy -D warnings, check all/no-default, nextest,
-# cargo-deny). The 3-OS matrix lives in the GitHub gate (gitlab.com shared runners
-# are linux-only). Toolchain pinned to 1.86.
+# cargo-deny). The OS matrix lives in the GitHub gate (gitlab.com shared runners
+# are linux-only). nextest + cargo-deny are installed as PREBUILT binaries so the
+# gate works on MSRV-pinned toolchains (cargo-install-from-source needs rustc>=1.91).
+# Toolchain pinned to 1.86.
 default:
   image: rust:1.86
   cache:
     key:
       files: [Cargo.lock]
     paths: [.cargo/, target/]
+  before_script:
+    - export PATH="$CARGO_HOME/bin:$PATH"
 
 variables:
   CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
@@ -39,13 +43,14 @@ check:
 test:
   stage: test
   script:
-    - cargo install cargo-nextest --locked || true
+    - curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "$CARGO_HOME/bin"
     - cargo nextest run --workspace --locked --all-features
     - cargo test --workspace --locked --all-features --doc
 
 security:
   stage: security
   script:
-    - cargo install cargo-deny --locked || true
+    - curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+    - cargo binstall -y cargo-deny
     - cargo deny check
     - cargo fetch --locked
