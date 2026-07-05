@@ -6,13 +6,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
+const MAX_JSON_RPC_LINE_BYTES: usize = 8 * 1024 * 1024;
 
 /// An MCP client connected to a child process over newline-delimited JSON-RPC.
 pub struct McpStdioClient {
@@ -291,10 +292,11 @@ struct WireToolDef {
 }
 
 async fn reader_loop(stdout: ChildStdout, pending: PendingMap) {
-    let mut lines = BufReader::new(stdout).lines();
+    let mut reader = BufReader::new(stdout);
+    let mut line = Vec::new();
 
     loop {
-        match lines.next_line().await {
+        match read_capped_line(&mut reader, &mut line).await {
             Ok(Some(line)) => {
                 if line.trim().is_empty() {
                     continue;
@@ -310,6 +312,50 @@ async fn reader_loop(stdout: ChildStdout, pending: PendingMap) {
                 fail_pending(&pending, &message).await;
                 return;
             }
+        }
+    }
+}
+
+async fn read_capped_line<R>(reader: &mut R, buffer: &mut Vec<u8>) -> Result<Option<String>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    buffer.clear();
+
+    loop {
+        let available = reader
+            .fill_buf()
+            .await
+            .context("failed to read MCP server stdout")?;
+        if available.is_empty() {
+            if buffer.is_empty() {
+                return Ok(None);
+            }
+            return Err(anyhow!("MCP server stdout closed mid-frame"));
+        }
+
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if buffer.len() + take > MAX_JSON_RPC_LINE_BYTES {
+            return Err(anyhow!(
+                "MCP server stdout line exceeded {MAX_JSON_RPC_LINE_BYTES} bytes"
+            ));
+        }
+
+        buffer.extend_from_slice(&available[..take]);
+        reader.consume(take);
+
+        if buffer.last() == Some(&b'\n') {
+            buffer.pop();
+            if buffer.last() == Some(&b'\r') {
+                buffer.pop();
+            }
+            let line = std::str::from_utf8(buffer)
+                .context("MCP server stdout line was not valid UTF-8")?
+                .to_string();
+            return Ok(Some(line));
         }
     }
 }
@@ -486,5 +532,29 @@ mod tests {
     #[test]
     fn decodes_base64_image_payload() {
         assert_eq!(decode_base64("aGVsbG8=").unwrap(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn capped_reader_accepts_normal_line() {
+        let mut reader = BufReader::new(b"{\"jsonrpc\":\"2.0\"}\n".as_slice());
+        let mut buffer = Vec::new();
+
+        let line = read_capped_line(&mut reader, &mut buffer).await.unwrap();
+
+        assert_eq!(line.as_deref(), Some(r#"{"jsonrpc":"2.0"}"#));
+    }
+
+    #[tokio::test]
+    async fn capped_reader_rejects_oversized_line() {
+        let input = vec![b'x'; MAX_JSON_RPC_LINE_BYTES + 1];
+        let mut reader = BufReader::new(input.as_slice());
+        let mut buffer = Vec::new();
+
+        let error = read_capped_line(&mut reader, &mut buffer)
+            .await
+            .expect_err("oversized line should fail")
+            .to_string();
+
+        assert!(error.contains("exceeded"));
     }
 }
