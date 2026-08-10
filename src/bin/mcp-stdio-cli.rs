@@ -64,6 +64,22 @@ async fn main() -> Result<()> {
                         println!("[image: {} bytes, {mime_type}]", data.len());
                     }
                     ContentBlock::ResourceLink(uri) => println!("[resource: {uri}]"),
+                    ContentBlock::EmbeddedResource {
+                        uri,
+                        mime_type,
+                        text,
+                        blob,
+                    } => {
+                        if let Some(text) = text {
+                            println!("[embedded resource: {uri}]\n{text}");
+                        } else {
+                            println!(
+                                "[embedded resource: {uri}, {} bytes, {}]",
+                                blob.map_or(0, |blob| blob.len()),
+                                mime_type.as_deref().unwrap_or("application/octet-stream")
+                            );
+                        }
+                    }
                 }
             }
             client.shutdown().await?;
