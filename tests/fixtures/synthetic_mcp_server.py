@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -151,6 +152,8 @@ for line in sys.stdin:
 delay = os.environ.get("MCP_STDIO_DELAY_EOF_MS")
 if delay:
     time.sleep(int(delay) / 1000)
+if mode == "descendant-holds-stdout":
+    subprocess.Popen([sys.executable, "-c", "import time; time.sleep(2)"])
 if mode == "ignore-eof":
     while True:
         time.sleep(30)

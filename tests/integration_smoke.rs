@@ -113,6 +113,28 @@ async fn request_timeout_is_enforced() {
 }
 
 #[tokio::test]
+async fn shutdown_is_bounded_when_descendant_holds_stdout() {
+    let (exe, args) = synthetic_server_command();
+    let options = McpStdioClientOptions {
+        shutdown_grace_period: Duration::from_millis(75),
+        ..McpStdioClientOptions::default()
+    };
+    let client = McpStdioClient::spawn_with_options(
+        exe,
+        &args,
+        &[("MCP_STDIO_SMOKE_SERVER", "descendant-holds-stdout")],
+        options,
+    )
+    .await
+    .expect("spawn server with stdout-inheriting descendant");
+
+    tokio::time::timeout(Duration::from_millis(500), client.shutdown())
+        .await
+        .expect("stdout-inheriting descendant must not block shutdown")
+        .expect("shutdown client");
+}
+
+#[tokio::test]
 async fn write_timeout_poisoned_transport_rejects_later_requests() {
     let (exe, args) = synthetic_server_command();
     let options = McpStdioClientOptions {

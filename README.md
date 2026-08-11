@@ -30,7 +30,11 @@ cargo add mcp-stdio-rs
 ```rust
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let c = mcp_stdio_rs::McpStdioClient::spawn("ssh", &["ultra", "mnemos-mcp"], &[]).await?;
+    let c = mcp_stdio_rs::McpStdioClient::spawn(
+        "ssh",
+        &["ultra", "mnemos", "serve", "mcp-stdio"],
+        &[],
+    ).await?;
     let r = c.call_tool("search_memories", serde_json::json!({ "query": "release notes" })).await?;
     println!("{r:#?}");
     c.shutdown().await?;

@@ -301,9 +301,15 @@ impl McpStdioClient {
             }
         }
 
-        reader_task
-            .await
-            .context("MCP stdout reader task failed to join")?;
+        // A descendant can keep the stdout pipe open after the direct child exits.
+        // Once that child is reaped there is no more shutdown work for the reader,
+        // so do not let an inherited descriptor make shutdown unbounded.
+        reader_task.abort();
+        match reader_task.await {
+            Ok(()) => {}
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => return Err(error).context("MCP stdout reader task failed to join"),
+        }
 
         Ok(())
     }
@@ -837,33 +843,43 @@ fn decode_content_block(value: Value) -> Result<ContentBlock> {
 }
 
 fn decode_base64(input: &str) -> Result<Vec<u8>> {
-    let mut output = Vec::with_capacity(input.len() * 3 / 4);
-    let mut buffer = [0_u8; 4];
-    let mut buffer_len = 0;
-
-    for byte in input.bytes().filter(|byte| !byte.is_ascii_whitespace()) {
-        if byte == b'=' {
-            buffer[buffer_len] = 64;
-        } else {
-            buffer[buffer_len] =
-                base64_value(byte).ok_or_else(|| anyhow!("invalid base64 byte `{byte}`"))?;
-        }
-        buffer_len += 1;
-
-        if buffer_len == 4 {
-            output.push((buffer[0] << 2) | (buffer[1] >> 4));
-            if buffer[2] != 64 {
-                output.push((buffer[1] << 4) | (buffer[2] >> 2));
-            }
-            if buffer[3] != 64 {
-                output.push((buffer[2] << 6) | buffer[3]);
-            }
-            buffer_len = 0;
-        }
+    if input.len() % 4 != 0 {
+        return Err(anyhow!("invalid base64 length"));
     }
 
-    if buffer_len != 0 {
-        return Err(anyhow!("invalid base64 length"));
+    let mut output = Vec::with_capacity(input.len() * 3 / 4);
+    let quartet_count = input.len() / 4;
+
+    for (index, quartet) in input.as_bytes().chunks_exact(4).enumerate() {
+        let final_quartet = index + 1 == quartet_count;
+        let first = base64_value(quartet[0])
+            .ok_or_else(|| anyhow!("invalid base64 byte `{}`", quartet[0]))?;
+        let second = base64_value(quartet[1])
+            .ok_or_else(|| anyhow!("invalid base64 byte `{}`", quartet[1]))?;
+
+        output.push((first << 2) | (second >> 4));
+
+        if quartet[2] == b'=' {
+            if !final_quartet || quartet[3] != b'=' || second & 0x0f != 0 {
+                return Err(anyhow!("invalid base64 padding"));
+            }
+            continue;
+        }
+
+        let third = base64_value(quartet[2])
+            .ok_or_else(|| anyhow!("invalid base64 byte `{}`", quartet[2]))?;
+        output.push((second << 4) | (third >> 2));
+
+        if quartet[3] == b'=' {
+            if !final_quartet || third & 0x03 != 0 {
+                return Err(anyhow!("invalid base64 padding"));
+            }
+            continue;
+        }
+
+        let fourth = base64_value(quartet[3])
+            .ok_or_else(|| anyhow!("invalid base64 byte `{}`", quartet[3]))?;
+        output.push((third << 6) | fourth);
     }
 
     Ok(output)
@@ -902,6 +918,31 @@ mod tests {
     #[test]
     fn decodes_base64_image_payload() {
         assert_eq!(decode_base64("aGVsbG8=").unwrap(), b"hello");
+        assert_eq!(decode_base64("aA==").unwrap(), b"h");
+        assert_eq!(
+            decode_base64("AAECAwQF").unwrap(),
+            b"\0\x01\x02\x03\x04\x05"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_base64_padding_and_trailing_bits() {
+        for invalid in [
+            "====",
+            "=AAA",
+            "AA=A",
+            "A===",
+            "aA==AAAA",
+            "aGVsbG8=AAAA",
+            "AB==",
+            "AAB=",
+            "aGVs\nbG8=",
+        ] {
+            assert!(
+                decode_base64(invalid).is_err(),
+                "invalid base64 was accepted: {invalid:?}"
+            );
+        }
     }
 
     #[test]
