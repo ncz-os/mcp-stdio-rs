@@ -112,6 +112,118 @@ async fn request_timeout_is_enforced() {
     client.shutdown().await.expect("shutdown client");
 }
 
+#[tokio::test]
+async fn write_timeout_poisoned_transport_rejects_later_requests() {
+    let (exe, args) = synthetic_server_command();
+    let options = McpStdioClientOptions {
+        request_timeout: Duration::from_millis(75),
+        shutdown_grace_period: Duration::from_millis(75),
+        ..McpStdioClientOptions::default()
+    };
+    let client = McpStdioClient::spawn_with_options(
+        exe,
+        &args,
+        &[("MCP_STDIO_SMOKE_SERVER", "stop-reading")],
+        options,
+    )
+    .await
+    .expect("spawn server that stops reading after initialization");
+
+    let error = client
+        .call_tool("echo", json!({"payload": "x".repeat(2 * 1024 * 1024)}))
+        .await
+        .expect_err("blocked partial frame must time out");
+    assert!(error.to_string().contains("writer timed out"));
+
+    let later = client
+        .list_tools()
+        .await
+        .expect_err("poisoned transport must reject later requests");
+    assert!(later.to_string().contains("transport is closed"));
+    client.shutdown().await.expect("shutdown client");
+}
+
+#[tokio::test]
+async fn repeated_pagination_cursor_is_rejected() {
+    let (exe, args) = synthetic_server_command();
+    let client = McpStdioClient::spawn(exe, &args, &[("MCP_STDIO_SMOKE_SERVER", "repeat-cursor")])
+        .await
+        .expect("spawn repeated-cursor server");
+
+    let error = client
+        .list_tools()
+        .await
+        .expect_err("repeated cursor must be rejected");
+    assert!(error.to_string().contains("repeated cursor"));
+    client.shutdown().await.expect("shutdown client");
+}
+
+#[tokio::test]
+async fn pagination_has_an_overall_deadline() {
+    let (exe, args) = synthetic_server_command();
+    let options = McpStdioClientOptions {
+        request_timeout: Duration::from_millis(100),
+        shutdown_grace_period: Duration::from_millis(75),
+        ..McpStdioClientOptions::default()
+    };
+    let client = McpStdioClient::spawn_with_options(
+        exe,
+        &args,
+        &[("MCP_STDIO_SMOKE_SERVER", "endless-pages")],
+        options,
+    )
+    .await
+    .expect("spawn endless pagination server");
+
+    let error = client
+        .list_tools()
+        .await
+        .expect_err("overall pagination deadline must be enforced");
+    assert!(error.to_string().contains("pagination timed out"));
+    client.shutdown().await.expect("shutdown client");
+}
+
+#[tokio::test]
+async fn pagination_page_and_tool_limits_are_enforced() {
+    let (exe, args) = synthetic_server_command();
+    let page_client =
+        McpStdioClient::spawn(exe, &args, &[("MCP_STDIO_SMOKE_SERVER", "too-many-pages")])
+            .await
+            .expect("spawn excessive-page server");
+    let page_error = page_client
+        .list_tools()
+        .await
+        .expect_err("page limit must be enforced");
+    assert!(page_error.to_string().contains("100-page limit"));
+    page_client.shutdown().await.expect("shutdown page client");
+
+    let tool_client =
+        McpStdioClient::spawn(exe, &args, &[("MCP_STDIO_SMOKE_SERVER", "too-many-tools")])
+            .await
+            .expect("spawn excessive-tool server");
+    let tool_error = tool_client
+        .list_tools()
+        .await
+        .expect_err("tool limit must be enforced");
+    assert!(tool_error.to_string().contains("10000-tool limit"));
+    tool_client.shutdown().await.expect("shutdown tool client");
+}
+
+#[tokio::test]
+async fn missing_tools_field_is_a_protocol_error() {
+    let (exe, args) = synthetic_server_command();
+    let client = McpStdioClient::spawn(exe, &args, &[("MCP_STDIO_SMOKE_SERVER", "missing-tools")])
+        .await
+        .expect("spawn missing-tools server");
+
+    let error = client
+        .list_tools()
+        .await
+        .expect_err("missing tools must not decode as an empty list");
+    assert!(format!("{error:#}").contains("missing field `tools`"));
+    client.shutdown().await.expect("shutdown client");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn dropping_client_kills_child() {

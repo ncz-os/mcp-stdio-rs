@@ -31,9 +31,58 @@ for line in sys.stdin:
             request_id,
         )
     elif method == "notifications/initialized":
-        pass
+        if mode == "stop-reading":
+            while True:
+                time.sleep(30)
     elif method == "tools/list" and mode == "malformed":
         print("{not valid JSON", flush=True)
+    elif method == "tools/list" and mode == "missing-tools":
+        send({}, request_id)
+    elif method == "tools/list" and mode == "repeat-cursor":
+        send(
+            {
+                "tools": [
+                    {
+                        "name": "repeated",
+                        "inputSchema": {"type": "object"},
+                    }
+                ],
+                "nextCursor": "same-cursor",
+            },
+            request_id,
+        )
+    elif method == "tools/list" and mode == "endless-pages":
+        time.sleep(0.04)
+        cursor = request.get("params", {}).get("cursor", "0")
+        send(
+            {
+                "tools": [],
+                "nextCursor": str(int(cursor) + 1),
+            },
+            request_id,
+        )
+    elif method == "tools/list" and mode == "too-many-pages":
+        cursor = request.get("params", {}).get("cursor", "0")
+        send(
+            {
+                "tools": [],
+                "nextCursor": str(int(cursor) + 1),
+            },
+            request_id,
+        )
+    elif method == "tools/list" and mode == "too-many-tools":
+        send(
+            {
+                "tools": [
+                    {
+                        "name": f"tool-{index}",
+                        "inputSchema": {"type": "object"},
+                    }
+                    for index in range(10_001)
+                ]
+            },
+            request_id,
+        )
     elif method == "tools/list" and mode == "stall-request":
         pass
     elif method == "tools/list":

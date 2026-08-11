@@ -1,22 +1,25 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 use tracing::{debug, warn};
 
 type PendingMap = Arc<StdMutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
-type SharedStdin = Arc<Mutex<ChildStdin>>;
+type WriterSender = mpsc::Sender<WriteCommand>;
 const MAX_JSON_RPC_LINE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_TOOL_PAGES: usize = 100;
+const MAX_TOOLS: usize = 10_000;
+const WRITER_QUEUE_CAPACITY: usize = 32;
 const SUPPORTED_PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// Deadlines used by [`McpStdioClient`].
@@ -24,7 +27,8 @@ const SUPPORTED_PROTOCOL_VERSION: &str = "2024-11-05";
 pub struct McpStdioClientOptions {
     /// Maximum time allowed for the initialize request and initialized notification.
     pub initialization_timeout: Duration,
-    /// Maximum time allowed for each tools/list or tools/call request.
+    /// Maximum time allowed for a tools/call request or the complete paginated
+    /// tools/list operation.
     pub request_timeout: Duration,
     /// Time allowed for graceful exit before SIGTERM, and again before a force-kill.
     pub shutdown_grace_period: Duration,
@@ -44,9 +48,10 @@ impl Default for McpStdioClientOptions {
 /// An MCP client connected to a child process over newline-delimited JSON-RPC.
 pub struct McpStdioClient {
     child: Mutex<Child>,
-    stdin: SharedStdin,
+    writer: WriterSender,
     pending: PendingMap,
     transport_open: Arc<AtomicBool>,
+    writer_task: JoinHandle<()>,
     reader_task: JoinHandle<()>,
     next_id: AtomicU64,
     options: McpStdioClientOptions,
@@ -91,21 +96,29 @@ impl McpStdioClient {
             .take()
             .context("child process stdout was not piped")?;
 
-        let stdin = Arc::new(Mutex::new(stdin));
         let pending = Arc::new(StdMutex::new(HashMap::new()));
         let transport_open = Arc::new(AtomicBool::new(true));
+        let (writer, writer_receiver) = mpsc::channel(WRITER_QUEUE_CAPACITY);
+        let writer_task = tokio::spawn(writer_loop(
+            stdin,
+            writer_receiver,
+            Arc::clone(&pending),
+            Arc::clone(&transport_open),
+        ));
         let reader_task = tokio::spawn(reader_loop(
             stdout,
             Arc::clone(&pending),
-            Arc::downgrade(&stdin),
+            writer.downgrade(),
             Arc::clone(&transport_open),
+            options.request_timeout,
         ));
 
         let client = Self {
             child: Mutex::new(child),
-            stdin,
+            writer,
             pending,
             transport_open,
+            writer_task,
             reader_task,
             next_id: AtomicU64::new(1),
             options,
@@ -162,7 +175,11 @@ impl McpStdioClient {
 
         let initialized = timeout(
             options.initialization_timeout,
-            client.send_notification("notifications/initialized", json!({})),
+            client.send_notification(
+                "notifications/initialized",
+                json!({}),
+                options.initialization_timeout,
+            ),
         )
         .await
         .map_err(|_| {
@@ -183,10 +200,22 @@ impl McpStdioClient {
 
     /// List available MCP tools from the server.
     pub async fn list_tools(&self) -> Result<Vec<ToolDef>> {
+        timeout(self.options.request_timeout, self.list_tools_pages())
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "MCP tools/list pagination timed out after {:?}",
+                    self.options.request_timeout
+                )
+            })?
+    }
+
+    async fn list_tools_pages(&self) -> Result<Vec<ToolDef>> {
         let mut tools = Vec::new();
         let mut cursor = None;
+        let mut seen_cursors = HashSet::new();
 
-        loop {
+        for page in 1..=MAX_TOOL_PAGES {
             let params = match &cursor {
                 Some(cursor) => json!({ "cursor": cursor }),
                 None => json!({}),
@@ -195,6 +224,11 @@ impl McpStdioClient {
             let result: ToolsListResult = serde_json::from_value(response)
                 .context("failed to decode MCP tools/list response")?;
 
+            if tools.len().saturating_add(result.tools.len()) > MAX_TOOLS {
+                return Err(anyhow!(
+                    "MCP tools/list response exceeded the {MAX_TOOLS}-tool limit"
+                ));
+            }
             tools.extend(result.tools.into_iter().map(|tool| ToolDef {
                 name: tool.name,
                 description: tool.description.unwrap_or_default(),
@@ -202,10 +236,24 @@ impl McpStdioClient {
             }));
 
             match result.next_cursor {
-                Some(next_cursor) => cursor = Some(next_cursor),
+                Some(next_cursor) => {
+                    if !seen_cursors.insert(next_cursor.clone()) {
+                        return Err(anyhow!(
+                            "MCP tools/list response repeated cursor `{next_cursor}`"
+                        ));
+                    }
+                    if page == MAX_TOOL_PAGES {
+                        return Err(anyhow!(
+                            "MCP tools/list response exceeded the {MAX_TOOL_PAGES}-page limit"
+                        ));
+                    }
+                    cursor = Some(next_cursor);
+                }
                 None => return Ok(tools),
             }
         }
+
+        unreachable!("page loop either returns a result or rejects its final cursor")
     }
 
     /// Call a named tool with JSON args, return the result.
@@ -226,15 +274,18 @@ impl McpStdioClient {
     pub async fn shutdown(self) -> Result<()> {
         let Self {
             child,
-            stdin,
+            writer,
             pending: _,
             transport_open: _,
+            writer_task,
             reader_task,
             next_id: _,
             options,
         } = self;
 
-        drop(stdin);
+        drop(writer);
+        writer_task.abort();
+        let _ = writer_task.await;
 
         let mut child = child.into_inner();
         if !wait_for_child(&mut child, options.shutdown_grace_period).await? {
@@ -287,31 +338,43 @@ impl McpStdioClient {
             params: Some(params),
         };
 
-        timeout(request_timeout, async {
-            self.write_json(&request).await?;
-            receiver
-                .await
-                .map_err(|_| anyhow!("MCP server closed before responding to request {id}"))?
-        })
-        .await
-        .map_err(|_| anyhow!("MCP request {id} ({method}) timed out after {request_timeout:?}"))?
+        let deadline = Instant::now() + request_timeout;
+        self.write_json(&request, deadline).await?;
+        timeout_at(deadline, receiver)
+            .await
+            .map_err(|_| {
+                anyhow!("MCP request {id} ({method}) timed out after {request_timeout:?}")
+            })?
+            .map_err(|_| anyhow!("MCP server closed before responding to request {id}"))?
     }
 
-    async fn send_notification(&self, method: &str, params: Value) -> Result<()> {
+    async fn send_notification(
+        &self,
+        method: &str,
+        params: Value,
+        write_timeout: Duration,
+    ) -> Result<()> {
         let notification = JsonRpcNotification {
             jsonrpc: "2.0".to_string(),
             method: method.to_string(),
             params: Some(params),
         };
-        self.write_json(&notification).await
+        self.write_json(&notification, Instant::now() + write_timeout)
+            .await
     }
 
-    async fn write_json<T>(&self, message: &T) -> Result<()>
+    async fn write_json<T>(&self, message: &T, deadline: Instant) -> Result<()>
     where
         T: Serialize + ?Sized,
     {
-        write_json(&self.stdin, message).await
+        enqueue_json(&self.writer, message, deadline).await
     }
+}
+
+struct WriteCommand {
+    line: Vec<u8>,
+    deadline: Instant,
+    completion: oneshot::Sender<Result<()>>,
 }
 
 struct PendingRequestGuard {
@@ -390,7 +453,6 @@ struct JsonRpcNotification {
 
 #[derive(Debug, Deserialize)]
 struct ToolsListResult {
-    #[serde(default)]
     tools: Vec<WireToolDef>,
     #[serde(rename = "nextCursor")]
     next_cursor: Option<String>,
@@ -418,15 +480,66 @@ struct WireToolDef {
     name: String,
     #[serde(default)]
     description: Option<String>,
-    #[serde(rename = "inputSchema", default)]
+    #[serde(rename = "inputSchema", deserialize_with = "deserialize_object")]
     input_schema: Value,
+}
+
+fn deserialize_object<'de, D>(deserializer: D) -> std::result::Result<Value, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    if value.is_object() {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom("expected an object"))
+    }
+}
+
+async fn writer_loop(
+    mut stdin: ChildStdin,
+    mut receiver: mpsc::Receiver<WriteCommand>,
+    pending: PendingMap,
+    transport_open: Arc<AtomicBool>,
+) {
+    while let Some(command) = receiver.recv().await {
+        let result = timeout_at(command.deadline, async {
+            stdin
+                .write_all(&command.line)
+                .await
+                .context("failed to write JSON-RPC message to MCP server stdin")?;
+            stdin
+                .flush()
+                .await
+                .context("failed to flush MCP server stdin")
+        })
+        .await;
+
+        let error = match result {
+            Ok(Ok(())) => {
+                let _ = command.completion.send(Ok(()));
+                continue;
+            }
+            Ok(Err(error)) => format!("MCP transport writer failed: {error:#}"),
+            Err(_) => "MCP transport writer timed out while writing a frame".to_string(),
+        };
+
+        transport_open.store(false, Ordering::SeqCst);
+        let _ = command.completion.send(Err(anyhow!(error.clone())));
+        fail_pending(&pending, &error).await;
+        return;
+    }
+
+    transport_open.store(false, Ordering::SeqCst);
+    fail_pending(&pending, "MCP transport writer closed").await;
 }
 
 async fn reader_loop(
     stdout: ChildStdout,
     pending: PendingMap,
-    stdin: std::sync::Weak<Mutex<ChildStdin>>,
+    writer: mpsc::WeakSender<WriteCommand>,
     transport_open: Arc<AtomicBool>,
+    write_timeout: Duration,
 ) {
     let mut reader = BufReader::new(stdout);
     let mut line = Vec::new();
@@ -437,7 +550,7 @@ async fn reader_loop(
                 if line.trim().is_empty() {
                     continue;
                 }
-                if !dispatch_line(&pending, &stdin, &transport_open, &line).await {
+                if !dispatch_line(&pending, &writer, &transport_open, write_timeout, &line).await {
                     return;
                 }
             }
@@ -502,8 +615,9 @@ where
 
 async fn dispatch_line(
     pending: &PendingMap,
-    stdin: &std::sync::Weak<Mutex<ChildStdin>>,
+    writer: &mpsc::WeakSender<WriteCommand>,
     transport_open: &AtomicBool,
+    write_timeout: Duration,
     line: &str,
 ) -> bool {
     let value = match serde_json::from_str::<Value>(line) {
@@ -523,13 +637,14 @@ async fn dispatch_line(
                 debug!("ignoring MCP ping notification without an id");
                 return true;
             };
-            let Some(stdin) = stdin.upgrade() else {
+            let Some(writer) = writer.upgrade() else {
                 transport_open.store(false, Ordering::SeqCst);
                 fail_pending(pending, "MCP transport closed while replying to ping").await;
                 return false;
             };
             let response = json!({ "jsonrpc": "2.0", "id": id, "result": {} });
-            if let Err(err) = write_json(&stdin, &response).await {
+            if let Err(err) = enqueue_json(&writer, &response, Instant::now() + write_timeout).await
+            {
                 let message = format!("failed to reply to MCP ping: {err:#}");
                 transport_open.store(false, Ordering::SeqCst);
                 fail_pending(pending, &message).await;
@@ -565,24 +680,26 @@ async fn dispatch_line(
     true
 }
 
-async fn write_json<T>(stdin: &Mutex<ChildStdin>, message: &T) -> Result<()>
+async fn enqueue_json<T>(writer: &WriterSender, message: &T, deadline: Instant) -> Result<()>
 where
     T: Serialize + ?Sized,
 {
     let mut line = serde_json::to_vec(message).context("failed to encode JSON-RPC message")?;
     line.push(b'\n');
+    let (completion, written) = oneshot::channel();
+    let command = WriteCommand {
+        line,
+        deadline,
+        completion,
+    };
 
-    let mut stdin = stdin.lock().await;
-    stdin
-        .write_all(&line)
+    timeout_at(deadline, writer.send(command))
         .await
-        .context("failed to write JSON-RPC message to MCP server stdin")?;
-    stdin
-        .flush()
+        .map_err(|_| anyhow!("MCP transport writer queue timed out"))?
+        .map_err(|_| anyhow!("MCP transport writer is closed"))?;
+    written
         .await
-        .context("failed to flush MCP server stdin")?;
-
-    Ok(())
+        .map_err(|_| anyhow!("MCP transport writer closed before completing a frame"))?
 }
 
 async fn wait_for_child(child: &mut Child, duration: Duration) -> Result<bool> {
@@ -627,10 +744,12 @@ async fn fail_pending(pending: &PendingMap, message: &str) {
 }
 
 fn decode_tool_result(value: Value) -> Result<ToolResult> {
-    let is_error = value
-        .get("isError")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let is_error = match value.get("isError") {
+        Some(is_error) => is_error
+            .as_bool()
+            .context("MCP tools/call response isError must be a boolean")?,
+        None => false,
+    };
     let content = value
         .get("content")
         .and_then(Value::as_array)
@@ -647,14 +766,14 @@ fn decode_content_block(value: Value) -> Result<ContentBlock> {
     let block_type = value
         .get("type")
         .and_then(Value::as_str)
-        .unwrap_or_default();
+        .context("MCP content block missing type")?;
 
     match block_type {
         "text" => Ok(ContentBlock::Text(
             value
                 .get("text")
                 .and_then(Value::as_str)
-                .unwrap_or_default()
+                .context("MCP text content block missing text")?
                 .to_string(),
         )),
         "image" => {
@@ -665,7 +784,7 @@ fn decode_content_block(value: Value) -> Result<ContentBlock> {
             let mime_type = value
                 .get("mimeType")
                 .and_then(Value::as_str)
-                .unwrap_or("application/octet-stream")
+                .context("MCP image content block missing mimeType")?
                 .to_string();
             Ok(ContentBlock::Image {
                 data: decode_base64(data)?,
@@ -786,6 +905,42 @@ mod tests {
     }
 
     #[test]
+    fn rejects_missing_mandatory_tools_list_fields() {
+        let missing_tools =
+            serde_json::from_value::<ToolsListResult>(json!({})).expect_err("tools is mandatory");
+        assert!(missing_tools.to_string().contains("tools"));
+
+        let missing_schema = serde_json::from_value::<ToolsListResult>(json!({
+            "tools": [{"name": "missing-schema"}]
+        }))
+        .expect_err("inputSchema is mandatory");
+        assert!(missing_schema.to_string().contains("inputSchema"));
+
+        serde_json::from_value::<ToolsListResult>(json!({"tools": {}}))
+            .expect_err("tools must be an array");
+        serde_json::from_value::<ToolsListResult>(json!({
+            "tools": [{"name": "wrong-schema", "inputSchema": 7}]
+        }))
+        .expect_err("inputSchema must be an object");
+    }
+
+    #[test]
+    fn rejects_missing_mandatory_content_fields() {
+        let text = decode_content_block(json!({"type": "text"})).expect_err("text is mandatory");
+        assert!(text.to_string().contains("missing text"));
+
+        let image = decode_content_block(json!({"type": "image", "data": "aGVsbG8="}))
+            .expect_err("mimeType is mandatory");
+        assert!(image.to_string().contains("missing mimeType"));
+
+        decode_content_block(json!({"type": "text", "text": 7}))
+            .expect_err("text must be a string");
+
+        decode_tool_result(json!({"content": [], "isError": "false"}))
+            .expect_err("isError must be a boolean when present");
+    }
+
+    #[test]
     fn default_deadlines_cover_mnemos_audit_drain() {
         let options = McpStdioClientOptions::default();
 
@@ -803,21 +958,30 @@ mod tests {
             .stdout(Stdio::piped())
             .kill_on_drop(true);
         let mut child = command.spawn().expect("spawn silent child");
-        let stdin = Arc::new(Mutex::new(child.stdin.take().expect("piped stdin")));
+        let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let pending = Arc::new(StdMutex::new(HashMap::new()));
         let transport_open = Arc::new(AtomicBool::new(true));
+        let (writer, writer_receiver) = mpsc::channel(WRITER_QUEUE_CAPACITY);
+        let writer_task = tokio::spawn(writer_loop(
+            stdin,
+            writer_receiver,
+            Arc::clone(&pending),
+            Arc::clone(&transport_open),
+        ));
         let reader_task = tokio::spawn(reader_loop(
             stdout,
             Arc::clone(&pending),
-            Arc::downgrade(&stdin),
+            writer.downgrade(),
             Arc::clone(&transport_open),
+            Duration::from_secs(30),
         ));
         let client = McpStdioClient {
             child: Mutex::new(child),
-            stdin,
+            writer,
             pending: Arc::clone(&pending),
             transport_open,
+            writer_task,
             reader_task,
             next_id: AtomicU64::new(1),
             options: McpStdioClientOptions {
