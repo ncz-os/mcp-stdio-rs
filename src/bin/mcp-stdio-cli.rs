@@ -38,51 +38,63 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::ListTools { cmd } => {
             let client = spawn_from_command_string(&cmd).await?;
-            let tools = client.list_tools().await?;
-            for tool in tools {
-                println!("{}", tool.name);
-                if !tool.description.is_empty() {
-                    println!("  {}", tool.description);
+            let operation = async {
+                let tools = client.list_tools().await?;
+                for tool in tools {
+                    println!("{}", tool.name);
+                    if !tool.description.is_empty() {
+                        println!("  {}", tool.description);
+                    }
+                    println!(
+                        "  input_schema: {}",
+                        serde_json::to_string_pretty(&tool.input_schema)?
+                    );
                 }
-                println!(
-                    "  input_schema: {}",
-                    serde_json::to_string_pretty(&tool.input_schema)?
-                );
+                Ok::<_, anyhow::Error>(())
             }
-            client.shutdown().await?;
+            .await;
+            let shutdown = client.shutdown().await;
+            operation?;
+            shutdown?;
         }
         Commands::Call { cmd, name, args } => {
             let args_json: Value =
                 serde_json::from_str(&args).context("failed to parse --args as JSON")?;
             let client = spawn_from_command_string(&cmd).await?;
-            let result = client.call_tool(&name, args_json).await?;
-            println!("is_error: {}", result.is_error);
-            for block in result.content {
-                match block {
-                    ContentBlock::Text(text) => println!("{text}"),
-                    ContentBlock::Image { data, mime_type } => {
-                        println!("[image: {} bytes, {mime_type}]", data.len());
-                    }
-                    ContentBlock::ResourceLink(uri) => println!("[resource: {uri}]"),
-                    ContentBlock::EmbeddedResource {
-                        uri,
-                        mime_type,
-                        text,
-                        blob,
-                    } => {
-                        if let Some(text) = text {
-                            println!("[embedded resource: {uri}]\n{text}");
-                        } else {
-                            println!(
-                                "[embedded resource: {uri}, {} bytes, {}]",
-                                blob.map_or(0, |blob| blob.len()),
-                                mime_type.as_deref().unwrap_or("application/octet-stream")
-                            );
+            let operation = async {
+                let result = client.call_tool(&name, args_json).await?;
+                println!("is_error: {}", result.is_error);
+                for block in result.content {
+                    match block {
+                        ContentBlock::Text(text) => println!("{text}"),
+                        ContentBlock::Image { data, mime_type } => {
+                            println!("[image: {} bytes, {mime_type}]", data.len());
+                        }
+                        ContentBlock::ResourceLink(uri) => println!("[resource: {uri}]"),
+                        ContentBlock::EmbeddedResource {
+                            uri,
+                            mime_type,
+                            text,
+                            blob,
+                        } => {
+                            if let Some(text) = text {
+                                println!("[embedded resource: {uri}]\n{text}");
+                            } else {
+                                println!(
+                                    "[embedded resource: {uri}, {} bytes, {}]",
+                                    blob.map_or(0, |blob| blob.len()),
+                                    mime_type.as_deref().unwrap_or("application/octet-stream")
+                                );
+                            }
                         }
                     }
                 }
+                Ok::<_, anyhow::Error>(())
             }
-            client.shutdown().await?;
+            .await;
+            let shutdown = client.shutdown().await;
+            operation?;
+            shutdown?;
         }
     }
 

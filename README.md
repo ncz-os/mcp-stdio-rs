@@ -20,6 +20,7 @@ cargo add mcp-stdio-rs
 ## Public API summary
 
 - `McpStdioClient::spawn(cmd, args, env)` starts an MCP server process over stdio and completes the initialize handshake.
+- `McpStdioClient::spawn_with_options(cmd, args, env, options)` allows callers to configure initialization, request, and shutdown deadlines.
 - `client.list_tools()` returns the server's available `ToolDef` values.
 - `client.call_tool(name, args)` sends `tools/call` with JSON arguments and returns `ToolResult`.
 - `client.shutdown()` sends a best-effort shutdown, kills the child process if needed, and joins the stdout reader task.

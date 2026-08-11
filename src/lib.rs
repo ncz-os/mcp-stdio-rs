@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -14,11 +14,32 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
-type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
+type PendingMap = Arc<StdMutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
 type SharedStdin = Arc<Mutex<ChildStdin>>;
 const MAX_JSON_RPC_LINE_BYTES: usize = 8 * 1024 * 1024;
 const SUPPORTED_PROTOCOL_VERSION: &str = "2024-11-05";
-const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(2);
+
+/// Deadlines used by [`McpStdioClient`].
+#[derive(Debug, Clone, Copy)]
+pub struct McpStdioClientOptions {
+    /// Maximum time allowed for the initialize request and initialized notification.
+    pub initialization_timeout: Duration,
+    /// Maximum time allowed for each tools/list or tools/call request.
+    pub request_timeout: Duration,
+    /// Time allowed for graceful exit before SIGTERM, and again before a force-kill.
+    pub shutdown_grace_period: Duration,
+}
+
+impl Default for McpStdioClientOptions {
+    fn default() -> Self {
+        Self {
+            initialization_timeout: Duration::from_secs(30),
+            request_timeout: Duration::from_secs(30),
+            // MNEMOS reserves up to five seconds to drain pending audit writes.
+            shutdown_grace_period: Duration::from_secs(6),
+        }
+    }
+}
 
 /// An MCP client connected to a child process over newline-delimited JSON-RPC.
 pub struct McpStdioClient {
@@ -28,6 +49,7 @@ pub struct McpStdioClient {
     transport_open: Arc<AtomicBool>,
     reader_task: JoinHandle<()>,
     next_id: AtomicU64,
+    options: McpStdioClientOptions,
 }
 
 impl McpStdioClient {
@@ -35,12 +57,23 @@ impl McpStdioClient {
     /// return a ready client. cmd is the executable, args are its arguments, env is
     /// additional environment key-value pairs to inject.
     pub async fn spawn(cmd: &str, args: &[&str], env: &[(&str, &str)]) -> Result<Self> {
+        Self::spawn_with_options(cmd, args, env, McpStdioClientOptions::default()).await
+    }
+
+    /// Spawn and initialize an MCP server using explicit request and shutdown deadlines.
+    pub async fn spawn_with_options(
+        cmd: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+        options: McpStdioClientOptions,
+    ) -> Result<Self> {
         let mut command = Command::new(cmd);
         command
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
 
         for (key, value) in env {
             command.env(key, value);
@@ -59,7 +92,7 @@ impl McpStdioClient {
             .context("child process stdout was not piped")?;
 
         let stdin = Arc::new(Mutex::new(stdin));
-        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let pending = Arc::new(StdMutex::new(HashMap::new()));
         let transport_open = Arc::new(AtomicBool::new(true));
         let reader_task = tokio::spawn(reader_loop(
             stdout,
@@ -75,6 +108,7 @@ impl McpStdioClient {
             transport_open,
             reader_task,
             next_id: AtomicU64::new(1),
+            options,
         };
 
         let initialize_params = json!({
@@ -87,7 +121,12 @@ impl McpStdioClient {
         });
 
         let initialize_response = match client
-            .send_request_with_id(0, "initialize", initialize_params)
+            .send_request_with_id(
+                0,
+                "initialize",
+                initialize_params,
+                options.initialization_timeout,
+            )
             .await
             .context("MCP initialize request failed")
         {
@@ -116,14 +155,25 @@ impl McpStdioClient {
         };
         if !initialize_result.capabilities.is_object() {
             let _ = client.shutdown().await;
-            return Err(anyhow!("MCP initialize response capabilities must be an object"));
+            return Err(anyhow!(
+                "MCP initialize response capabilities must be an object"
+            ));
         }
 
-        if let Err(err) = client
-            .send_notification("notifications/initialized", json!({}))
-            .await
-            .context("failed to send MCP initialized notification")
-        {
+        let initialized = timeout(
+            options.initialization_timeout,
+            client.send_notification("notifications/initialized", json!({})),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "MCP initialized notification timed out after {:?}",
+                options.initialization_timeout
+            )
+        })
+        .and_then(|result| result)
+        .context("failed to send MCP initialized notification");
+        if let Err(err) = initialized {
             let _ = client.shutdown().await;
             return Err(err);
         }
@@ -181,14 +231,15 @@ impl McpStdioClient {
             transport_open: _,
             reader_task,
             next_id: _,
+            options,
         } = self;
 
         drop(stdin);
 
         let mut child = child.into_inner();
-        if !wait_for_child(&mut child, SHUTDOWN_GRACE_PERIOD).await? {
+        if !wait_for_child(&mut child, options.shutdown_grace_period).await? {
             request_termination(&mut child)?;
-            if !wait_for_child(&mut child, SHUTDOWN_GRACE_PERIOD).await? {
+            if !wait_for_child(&mut child, options.shutdown_grace_period).await? {
                 child
                     .start_kill()
                     .context("failed to force-kill MCP server child")?;
@@ -208,17 +259,26 @@ impl McpStdioClient {
 
     async fn send_request(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        self.send_request_with_id(id, method, params).await
+        self.send_request_with_id(id, method, params, self.options.request_timeout)
+            .await
     }
 
-    async fn send_request_with_id(&self, id: u64, method: &str, params: Value) -> Result<Value> {
+    async fn send_request_with_id(
+        &self,
+        id: u64,
+        method: &str,
+        params: Value,
+        request_timeout: Duration,
+    ) -> Result<Value> {
         let (sender, receiver) = oneshot::channel();
-        let mut pending = self.pending.lock().await;
-        if !self.transport_open.load(Ordering::SeqCst) {
-            return Err(anyhow!("MCP server transport is closed"));
+        {
+            let mut pending = lock_pending(&self.pending);
+            if !self.transport_open.load(Ordering::SeqCst) {
+                return Err(anyhow!("MCP server transport is closed"));
+            }
+            pending.insert(id, sender);
         }
-        pending.insert(id, sender);
-        drop(pending);
+        let _pending_guard = PendingRequestGuard::new(id, Arc::clone(&self.pending));
 
         let request = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -227,14 +287,14 @@ impl McpStdioClient {
             params: Some(params),
         };
 
-        if let Err(err) = self.write_json(&request).await {
-            self.pending.lock().await.remove(&id);
-            return Err(err);
-        }
-
-        receiver
-            .await
-            .map_err(|_| anyhow!("MCP server closed before responding to request {id}"))?
+        timeout(request_timeout, async {
+            self.write_json(&request).await?;
+            receiver
+                .await
+                .map_err(|_| anyhow!("MCP server closed before responding to request {id}"))?
+        })
+        .await
+        .map_err(|_| anyhow!("MCP request {id} ({method}) timed out after {request_timeout:?}"))?
     }
 
     async fn send_notification(&self, method: &str, params: Value) -> Result<()> {
@@ -252,6 +312,31 @@ impl McpStdioClient {
     {
         write_json(&self.stdin, message).await
     }
+}
+
+struct PendingRequestGuard {
+    id: u64,
+    pending: PendingMap,
+}
+
+impl PendingRequestGuard {
+    fn new(id: u64, pending: PendingMap) -> Self {
+        Self { id, pending }
+    }
+}
+
+impl Drop for PendingRequestGuard {
+    fn drop(&mut self) {
+        lock_pending(&self.pending).remove(&self.id);
+    }
+}
+
+fn lock_pending(
+    pending: &PendingMap,
+) -> std::sync::MutexGuard<'_, HashMap<u64, oneshot::Sender<Result<Value>>>> {
+    pending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// MCP tool definition returned by `tools/list`.
@@ -273,7 +358,10 @@ pub struct ToolResult {
 #[derive(Debug)]
 pub enum ContentBlock {
     Text(String),
-    Image { data: Vec<u8>, mime_type: String },
+    Image {
+        data: Vec<u8>,
+        mime_type: String,
+    },
     ResourceLink(String),
     EmbeddedResource {
         uri: String,
@@ -458,7 +546,7 @@ async fn dispatch_line(
         return true;
     };
 
-    let Some(sender) = pending.lock().await.remove(&id) else {
+    let Some(sender) = lock_pending(pending).remove(&id) else {
         warn!("received MCP response for unknown request id {id}");
         return true;
     };
@@ -532,7 +620,7 @@ fn request_termination(child: &mut Child) -> Result<()> {
 }
 
 async fn fail_pending(pending: &PendingMap, message: &str) {
-    let mut pending = pending.lock().await;
+    let mut pending = lock_pending(pending);
     for (_, sender) in pending.drain() {
         let _ = sender.send(Err(anyhow!(message.to_string())));
     }
@@ -695,6 +783,58 @@ mod tests {
     #[test]
     fn decodes_base64_image_payload() {
         assert_eq!(decode_base64("aGVsbG8=").unwrap(), b"hello");
+    }
+
+    #[test]
+    fn default_deadlines_cover_mnemos_audit_drain() {
+        let options = McpStdioClientOptions::default();
+
+        assert_eq!(options.initialization_timeout, Duration::from_secs(30));
+        assert_eq!(options.request_timeout, Duration::from_secs(30));
+        assert_eq!(options.shutdown_grace_period, Duration::from_secs(6));
+    }
+
+    #[tokio::test]
+    async fn cancelling_request_removes_pending_entry() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "exec cat"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn().expect("spawn silent child");
+        let stdin = Arc::new(Mutex::new(child.stdin.take().expect("piped stdin")));
+        let stdout = child.stdout.take().expect("piped stdout");
+        let pending = Arc::new(StdMutex::new(HashMap::new()));
+        let transport_open = Arc::new(AtomicBool::new(true));
+        let reader_task = tokio::spawn(reader_loop(
+            stdout,
+            Arc::clone(&pending),
+            Arc::downgrade(&stdin),
+            Arc::clone(&transport_open),
+        ));
+        let client = McpStdioClient {
+            child: Mutex::new(child),
+            stdin,
+            pending: Arc::clone(&pending),
+            transport_open,
+            reader_task,
+            next_id: AtomicU64::new(1),
+            options: McpStdioClientOptions {
+                shutdown_grace_period: Duration::from_millis(25),
+                ..McpStdioClientOptions::default()
+            },
+        };
+
+        let cancelled = timeout(
+            Duration::from_millis(25),
+            client.send_request_with_id(7, "tools/list", json!({}), Duration::from_secs(30)),
+        )
+        .await;
+
+        assert!(cancelled.is_err(), "request should be externally cancelled");
+        assert!(lock_pending(&pending).is_empty());
+        client.shutdown().await.expect("shutdown silent child");
     }
 
     #[test]

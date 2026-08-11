@@ -1,21 +1,19 @@
 use std::io::{self, BufRead, Write};
 use std::time::{Duration, Instant};
 
-use mcp_stdio_rs::{ContentBlock, McpStdioClient};
+use mcp_stdio_rs::{ContentBlock, McpStdioClient, McpStdioClientOptions};
 use serde_json::{Value, json};
 
 #[tokio::test]
 async fn smoke_echo_tool_over_stdio_child() {
-    let exe = std::env::current_exe().expect("current test executable path");
-    let exe = exe.to_str().expect("test executable path must be UTF-8");
-    let args = ["--exact", "mcp_stdio_smoke_server", "--nocapture"];
+    let (exe, args) = synthetic_server_command();
 
     let client = McpStdioClient::spawn(
         exe,
         &args,
         &[
             ("MCP_STDIO_SMOKE_SERVER", "normal"),
-            ("MCP_STDIO_DELAY_EOF_MS", "300"),
+            ("MCP_STDIO_DELAY_EOF_MS", "2200"),
         ],
     )
     .await
@@ -52,21 +50,113 @@ async fn smoke_echo_tool_over_stdio_child() {
 
     let shutdown_started = Instant::now();
     client.shutdown().await.expect("shutdown client");
-    assert!(shutdown_started.elapsed() >= Duration::from_millis(250));
+    assert!(shutdown_started.elapsed() >= Duration::from_millis(2100));
+}
+
+#[tokio::test]
+async fn initialization_timeout_is_enforced() {
+    let (exe, args) = synthetic_server_command();
+    let options = McpStdioClientOptions {
+        initialization_timeout: Duration::from_millis(75),
+        shutdown_grace_period: Duration::from_millis(75),
+        ..McpStdioClientOptions::default()
+    };
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        McpStdioClient::spawn_with_options(
+            exe,
+            &args,
+            &[("MCP_STDIO_SMOKE_SERVER", "stall-initialize")],
+            options,
+        ),
+    )
+    .await
+    .expect("client must enforce its initialization timeout");
+    let error = match result {
+        Ok(client) => {
+            client.shutdown().await.expect("shutdown unexpected client");
+            panic!("stalled initialization must fail");
+        }
+        Err(error) => error,
+    };
+    assert!(format!("{error:#}").contains("timed out"));
+}
+
+#[tokio::test]
+async fn request_timeout_is_enforced() {
+    let (exe, args) = synthetic_server_command();
+    let options = McpStdioClientOptions {
+        request_timeout: Duration::from_millis(75),
+        shutdown_grace_period: Duration::from_millis(75),
+        ..McpStdioClientOptions::default()
+    };
+    let client = McpStdioClient::spawn_with_options(
+        exe,
+        &args,
+        &[("MCP_STDIO_SMOKE_SERVER", "stall-request")],
+        options,
+    )
+    .await
+    .expect("spawn stalled-request server");
+
+    let result = tokio::time::timeout(Duration::from_secs(1), client.list_tools())
+        .await
+        .expect("client must enforce its request timeout");
+    assert!(
+        result
+            .expect_err("stalled request must fail")
+            .to_string()
+            .contains("timed out")
+    );
+    client.shutdown().await.expect("shutdown client");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dropping_client_kills_child() {
+    let (exe, args) = synthetic_server_command();
+    let client = McpStdioClient::spawn(exe, &args, &[("MCP_STDIO_SMOKE_SERVER", "ignore-eof")])
+        .await
+        .expect("spawn ignore-EOF server");
+    let result = client
+        .call_tool("echo", json!({ "msg": "__pid__" }))
+        .await
+        .expect("read child pid");
+    let pid = result
+        .content
+        .iter()
+        .find_map(|block| match block {
+            ContentBlock::Text(text) => text.parse::<i32>().ok(),
+            _ => None,
+        })
+        .expect("tool result must contain child pid");
+
+    drop(client);
+
+    let stopped = tokio::time::timeout(Duration::from_secs(2), async {
+        while process_exists(pid) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(stopped.is_ok(), "child {pid} survived client drop");
+}
+
+#[cfg(unix)]
+fn process_exists(pid: i32) -> bool {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    unsafe { kill(pid, 0) == 0 }
 }
 
 #[tokio::test]
 async fn malformed_response_fails_request_and_transport() {
-    let exe = std::env::current_exe().expect("current test executable path");
-    let exe = exe.to_str().expect("test executable path must be UTF-8");
-    let args = ["--exact", "mcp_stdio_smoke_server", "--nocapture"];
-    let client = McpStdioClient::spawn(
-        exe,
-        &args,
-        &[("MCP_STDIO_SMOKE_SERVER", "malformed")],
-    )
-    .await
-    .expect("spawn malformed-response server");
+    let (exe, args) = synthetic_server_command();
+    let client = McpStdioClient::spawn(exe, &args, &[("MCP_STDIO_SMOKE_SERVER", "malformed")])
+        .await
+        .expect("spawn malformed-response server");
 
     let first = tokio::time::timeout(Duration::from_secs(1), client.list_tools())
         .await
@@ -84,9 +174,7 @@ async fn malformed_response_fails_request_and_transport() {
 
 #[tokio::test]
 async fn rejects_unsupported_initialize_version() {
-    let exe = std::env::current_exe().expect("current test executable path");
-    let exe = exe.to_str().expect("test executable path must be UTF-8");
-    let args = ["--exact", "mcp_stdio_smoke_server", "--nocapture"];
+    let (exe, args) = synthetic_server_command();
 
     let error = match McpStdioClient::spawn(
         exe,
@@ -102,6 +190,19 @@ async fn rejects_unsupported_initialize_version() {
         Err(error) => error,
     };
     assert!(error.to_string().contains("unsupported protocol version"));
+}
+
+fn synthetic_server_command() -> (&'static str, [&'static str; 2]) {
+    (
+        "python3",
+        [
+            "-u",
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/synthetic_mcp_server.py"
+            ),
+        ],
+    )
 }
 
 #[test]
@@ -239,7 +340,9 @@ fn run_synthetic_server() {
     }
 
     if let Ok(delay) = std::env::var("MCP_STDIO_DELAY_EOF_MS") {
-        std::thread::sleep(Duration::from_millis(delay.parse().expect("valid EOF delay")));
+        std::thread::sleep(Duration::from_millis(
+            delay.parse().expect("valid EOF delay"),
+        ));
     }
 }
 
