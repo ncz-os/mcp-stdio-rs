@@ -8,6 +8,10 @@ import time
 
 mode = os.environ["MCP_STDIO_SMOKE_SERVER"]
 
+if mode == "fail-stderr":
+    print("boom: missing token", file=sys.stderr, flush=True)
+    sys.exit(1)
+
 
 def send(result, request_id):
     print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)

@@ -326,6 +326,85 @@ async fn rejects_unsupported_initialize_version() {
     assert!(error.to_string().contains("unsupported protocol version"));
 }
 
+#[tokio::test]
+async fn failing_server_stderr_tail_is_attached_to_initialize_error() {
+    use mcp_stdio_rs::StderrPolicy;
+    let (exe, args) = synthetic_server_command();
+    let options = McpStdioClientOptions {
+        stderr: StderrPolicy::capture(),
+        initialization_timeout: Duration::from_secs(5),
+        shutdown_grace_period: Duration::from_millis(100),
+        ..McpStdioClientOptions::default()
+    };
+
+    let outcome = McpStdioClient::spawn_with_options(
+        exe,
+        &args,
+        &[("MCP_STDIO_SMOKE_SERVER", "fail-stderr")],
+        options,
+    )
+    .await;
+    let error = match outcome {
+        Ok(client) => {
+            client.shutdown().await.expect("shutdown unexpected client");
+            panic!("server that exits during initialize must fail");
+        }
+        Err(error) => error,
+    };
+
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("boom: missing token"),
+        "initialize error must contain the captured stderr tail, got: {message}"
+    );
+}
+
+#[tokio::test]
+async fn stderr_inherit_is_the_default_and_captures_nothing() {
+    let (exe, args) = synthetic_server_command();
+    let options = McpStdioClientOptions::default();
+    assert_eq!(options.stderr, mcp_stdio_rs::StderrPolicy::Inherit);
+
+    let client = McpStdioClient::spawn(exe, &args, &[("MCP_STDIO_SMOKE_SERVER", "normal")])
+        .await
+        .expect("spawn normal server with default options");
+    assert_eq!(client.stderr_tail(), "");
+    client.shutdown().await.expect("shutdown client");
+}
+
+#[tokio::test]
+async fn stderr_capture_ring_is_bounded() {
+    use mcp_stdio_rs::StderrPolicy;
+    let (exe, args) = synthetic_server_command();
+    let options = McpStdioClientOptions {
+        stderr: StderrPolicy::capture_with_max_bytes(16),
+        shutdown_grace_period: Duration::from_millis(100),
+        ..McpStdioClientOptions::default()
+    };
+
+    let outcome = McpStdioClient::spawn_with_options(
+        exe,
+        &args,
+        &[("MCP_STDIO_SMOKE_SERVER", "fail-stderr")],
+        options,
+    )
+    .await;
+    let error = match outcome {
+        Ok(client) => {
+            client.shutdown().await.expect("shutdown unexpected client");
+            panic!("server that exits during initialize must fail");
+        }
+        Err(error) => error,
+    };
+
+    // The 16-byte ring keeps only the tail of "boom: missing token\n".
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("missing token"),
+        "bounded tail must keep the most recent bytes, got: {message}"
+    );
+}
+
 fn synthetic_server_command() -> (&'static str, [&'static str; 2]) {
     (
         "python3",

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -7,8 +7,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout, timeout_at};
@@ -21,8 +21,140 @@ const MAX_TOOL_PAGES: usize = 100;
 const MAX_TOOLS: usize = 10_000;
 const WRITER_QUEUE_CAPACITY: usize = 32;
 const SUPPORTED_PROTOCOL_VERSION: &str = "2024-11-05";
+/// Default bound for captured child stderr (last bytes kept per client).
+const DEFAULT_STDERR_CAP_BYTES: usize = 8 * 1024;
+/// Hard ceiling for a caller-supplied stderr capture bound.
+const MAX_STDERR_CAP_BYTES: usize = 1024 * 1024;
+/// How long transport-closed errors wait for a final stderr drain before
+/// attaching whatever tail has been captured so far.
+const STDERR_EOF_WAIT: Duration = Duration::from_millis(250);
+/// Marker prefix used when a captured stderr tail is attached to an error.
+const STDERR_TAIL_MARKER: &str = "MCP server stderr (tail):";
 
-/// Deadlines used by [`McpStdioClient`].
+/// Controls what happens to the child server process's stderr stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StderrPolicy {
+    /// Child stderr is inherited by the parent process (historical behavior).
+    /// Nothing is captured and errors carry no stderr tail.
+    Inherit,
+    /// Child stderr is piped and drained into a bounded ring buffer holding
+    /// at most `max_bytes` of the most recent output.
+    Capture {
+        /// Maximum number of recent stderr bytes retained.
+        max_bytes: usize,
+    },
+}
+
+impl StderrPolicy {
+    /// Capture the last 8 KiB of child stderr.
+    pub fn capture() -> Self {
+        Self::Capture {
+            max_bytes: DEFAULT_STDERR_CAP_BYTES,
+        }
+    }
+
+    /// Capture the last `max_bytes` of child stderr.
+    ///
+    /// Values above 1 MiB are clamped to 1 MiB.
+    pub fn capture_with_max_bytes(max_bytes: usize) -> Self {
+        Self::Capture {
+            max_bytes: max_bytes.min(MAX_STDERR_CAP_BYTES),
+        }
+    }
+}
+
+impl Default for StderrPolicy {
+    fn default() -> Self {
+        Self::Inherit
+    }
+}
+
+#[cfg(test)]
+impl StderrPolicy {
+    fn max_bytes_for_test(self) -> usize {
+        match self {
+            Self::Inherit => 0,
+            Self::Capture { max_bytes } => max_bytes,
+        }
+    }
+}
+
+/// Bounded ring buffer holding the most recent stderr bytes plus an
+/// EOF signal so error paths can wait for the final drain.
+struct StderrState {
+    buffer: StdMutex<StderrBuffer>,
+    drained: tokio::sync::Notify,
+}
+
+struct StderrBuffer {
+    chunks: VecDeque<u8>,
+    len: usize,
+    cap: usize,
+    eof: bool,
+}
+
+impl StderrState {
+    fn new(cap: usize) -> Self {
+        Self {
+            buffer: StdMutex::new(StderrBuffer {
+                chunks: VecDeque::new(),
+                len: 0,
+                cap,
+                eof: false,
+            }),
+            drained: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn push_bytes(&self, bytes: &[u8]) {
+        let mut buffer = self
+            .buffer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // cap == 0 stores nothing but the caller keeps draining, so a
+        // chatty child can never block on a full stderr pipe.
+        for &byte in bytes {
+            if buffer.cap == 0 {
+                return;
+            }
+            if buffer.len == buffer.cap {
+                buffer.chunks.pop_front();
+            } else {
+                buffer.len += 1;
+            }
+            buffer.chunks.push_back(byte);
+        }
+    }
+
+    fn mark_eof(&self) {
+        let mut buffer = self
+            .buffer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        buffer.eof = true;
+        self.drained.notify_waiters();
+    }
+
+    fn snapshot(&self) -> (Vec<u8>, bool) {
+        let buffer = self
+            .buffer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (
+            buffer.chunks.iter().copied().collect::<Vec<u8>>(),
+            buffer.eof,
+        )
+    }
+
+    fn tail_string(&self) -> String {
+        let (bytes, _) = self.snapshot();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+type StderrTail = Arc<StderrState>;
+
+/// Deadlines and stdio behavior used by [`McpStdioClient`].
 #[derive(Debug, Clone, Copy)]
 pub struct McpStdioClientOptions {
     /// Maximum time allowed for the initialize request and initialized notification.
@@ -32,6 +164,11 @@ pub struct McpStdioClientOptions {
     pub request_timeout: Duration,
     /// Time allowed for graceful exit before SIGTERM, and again before a force-kill.
     pub shutdown_grace_period: Duration,
+    /// What to do with the child server process's stderr stream.
+    /// Defaults to [`StderrPolicy::Inherit`]; use
+    /// [`StderrPolicy::capture`](StderrPolicy::capture) to retain the tail
+    /// and have it appended to transport-closed errors.
+    pub stderr: StderrPolicy,
 }
 
 impl Default for McpStdioClientOptions {
@@ -41,6 +178,7 @@ impl Default for McpStdioClientOptions {
             request_timeout: Duration::from_secs(30),
             // MNEMOS reserves up to five seconds to drain pending audit writes.
             shutdown_grace_period: Duration::from_secs(6),
+            stderr: StderrPolicy::Inherit,
         }
     }
 }
@@ -53,6 +191,8 @@ pub struct McpStdioClient {
     transport_open: Arc<AtomicBool>,
     writer_task: JoinHandle<()>,
     reader_task: JoinHandle<()>,
+    stderr_task: Option<JoinHandle<()>>,
+    stderr_tail: Option<StderrTail>,
     next_id: AtomicU64,
     options: McpStdioClientOptions,
 }
@@ -77,8 +217,15 @@ impl McpStdioClient {
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
             .kill_on_drop(true);
+        match options.stderr {
+            StderrPolicy::Inherit => {
+                command.stderr(Stdio::inherit());
+            }
+            StderrPolicy::Capture { .. } => {
+                command.stderr(Stdio::piped());
+            }
+        }
 
         for (key, value) in env {
             command.env(key, value);
@@ -96,6 +243,19 @@ impl McpStdioClient {
             .take()
             .context("child process stdout was not piped")?;
 
+        let (stderr_tail, stderr_task) = match options.stderr {
+            StderrPolicy::Inherit => (None, None),
+            StderrPolicy::Capture { max_bytes } => {
+                let stderr = child
+                    .stderr
+                    .take()
+                    .context("child process stderr was not piped")?;
+                let tail = Arc::new(StderrState::new(max_bytes));
+                let task = tokio::spawn(stderr_drain_loop(stderr, Arc::clone(&tail)));
+                (Some(tail), Some(task))
+            }
+        };
+
         let pending = Arc::new(StdMutex::new(HashMap::new()));
         let transport_open = Arc::new(AtomicBool::new(true));
         let (writer, writer_receiver) = mpsc::channel(WRITER_QUEUE_CAPACITY);
@@ -104,6 +264,7 @@ impl McpStdioClient {
             writer_receiver,
             Arc::clone(&pending),
             Arc::clone(&transport_open),
+            stderr_tail.clone(),
         ));
         let reader_task = tokio::spawn(reader_loop(
             stdout,
@@ -111,6 +272,7 @@ impl McpStdioClient {
             writer.downgrade(),
             Arc::clone(&transport_open),
             options.request_timeout,
+            stderr_tail.clone(),
         ));
 
         let client = Self {
@@ -120,6 +282,8 @@ impl McpStdioClient {
             transport_open,
             writer_task,
             reader_task,
+            stderr_task,
+            stderr_tail,
             next_id: AtomicU64::new(1),
             options,
         };
@@ -145,6 +309,7 @@ impl McpStdioClient {
         {
             Ok(response) => response,
             Err(err) => {
+                let err = with_stderr_tail(err, &client.stderr_tail).await;
                 let _ = client.shutdown().await;
                 return Err(err);
             }
@@ -270,6 +435,15 @@ impl McpStdioClient {
         decode_tool_result(response)
     }
 
+    /// Return the captured child stderr tail (most recent bytes, lossy UTF-8).
+    /// Returns an empty string unless [`StderrPolicy::Capture`] was selected.
+    pub fn stderr_tail(&self) -> String {
+        self.stderr_tail
+            .as_ref()
+            .map(|tail| tail.tail_string())
+            .unwrap_or_default()
+    }
+
     /// Close the transport and stop the child process, allowing graceful cleanup first.
     pub async fn shutdown(self) -> Result<()> {
         let Self {
@@ -279,6 +453,8 @@ impl McpStdioClient {
             transport_open: _,
             writer_task,
             reader_task,
+            stderr_task,
+            stderr_tail: _,
             next_id: _,
             options,
         } = self;
@@ -310,6 +486,23 @@ impl McpStdioClient {
             Err(error) if error.is_cancelled() => {}
             Err(error) => return Err(error).context("MCP stdout reader task failed to join"),
         }
+        if let Some(stderr_task) = stderr_task {
+            // `timeout` consumes the handle, so borrow an abort handle first;
+            // on expiry abort the drain instead of leaking it with the pipe open.
+            let abort = stderr_task.abort_handle();
+            match timeout(options.shutdown_grace_period, stderr_task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) if error.is_cancelled() => {}
+                Ok(Err(error)) => {
+                    return Err(error).context("MCP stderr reader task failed to join");
+                }
+                Err(_) => {
+                    // The child is already reaped above; do not leak the drain
+                    // task holding the stderr pipe open.
+                    abort.abort();
+                }
+            }
+        }
 
         Ok(())
     }
@@ -328,13 +521,14 @@ impl McpStdioClient {
         request_timeout: Duration,
     ) -> Result<Value> {
         let (sender, receiver) = oneshot::channel();
-        {
-            let mut pending = lock_pending(&self.pending);
-            if !self.transport_open.load(Ordering::SeqCst) {
-                return Err(anyhow!("MCP server transport is closed"));
-            }
-            pending.insert(id, sender);
+        if !self.transport_open.load(Ordering::SeqCst) {
+            let tail = collect_stderr_tail(&self.stderr_tail).await;
+            return Err(with_tail_suffix(
+                anyhow!("MCP server transport is closed"),
+                &tail,
+            ));
         }
+        lock_pending(&self.pending).insert(id, sender);
         let _pending_guard = PendingRequestGuard::new(id, Arc::clone(&self.pending));
 
         let request = JsonRpcRequest {
@@ -346,12 +540,19 @@ impl McpStdioClient {
 
         let deadline = Instant::now() + request_timeout;
         self.write_json(&request, deadline).await?;
-        timeout_at(deadline, receiver)
-            .await
-            .map_err(|_| {
-                anyhow!("MCP request {id} ({method}) timed out after {request_timeout:?}")
-            })?
-            .map_err(|_| anyhow!("MCP server closed before responding to request {id}"))?
+        let response = timeout_at(deadline, receiver).await.map_err(|_| {
+            anyhow!("MCP request {id} ({method}) timed out after {request_timeout:?}")
+        })?;
+        match response {
+            Ok(value) => value,
+            Err(_) => {
+                let tail = collect_stderr_tail(&self.stderr_tail).await;
+                Err(with_tail_suffix(
+                    anyhow!("MCP server closed before responding to request {id}"),
+                    &tail,
+                ))
+            }
+        }
     }
 
     async fn send_notification(
@@ -406,6 +607,52 @@ fn lock_pending(
     pending
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Best-effort snapshot of the captured stderr tail. Waits briefly for the
+/// drain task to signal EOF (child exit closes the pipe) so a server that
+/// prints its reason and exits has its final bytes included; falls back to
+/// whatever has been captured so far. Empty when `Inherit` is in effect.
+async fn collect_stderr_tail(stderr_tail: &Option<StderrTail>) -> String {
+    let Some(tail) = stderr_tail else {
+        return String::new();
+    };
+    // Wait for the drain task to observe pipe EOF (child exit closes it),
+    // bounded by STDERR_EOF_WAIT. Loop until the buffer stops changing so a
+    // wake that races a final push cannot truncate the tail.
+    let deadline = Instant::now() + STDERR_EOF_WAIT;
+    let bytes: Vec<u8> = loop {
+        let (snapshot, eof) = tail.snapshot();
+        if eof {
+            // One final snapshot: mark_eof holds no data, so a push racing
+            // the EOF flag lands either before or inside this read.
+            let (fresh, _) = tail.snapshot();
+            break if fresh.len() >= snapshot.len() {
+                fresh
+            } else {
+                snapshot
+            };
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break snapshot;
+        }
+        let _ = timeout(remaining, tail.drained.notified()).await;
+    };
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn with_tail_suffix(error: anyhow::Error, tail: &str) -> anyhow::Error {
+    let trimmed = tail.trim();
+    if trimmed.is_empty() {
+        return error;
+    }
+    anyhow!("{error:#}\n{STDERR_TAIL_MARKER}\n{trimmed}")
+}
+
+async fn with_stderr_tail(error: anyhow::Error, stderr_tail: &Option<StderrTail>) -> anyhow::Error {
+    let tail = collect_stderr_tail(stderr_tail).await;
+    with_tail_suffix(error, &tail)
 }
 
 /// MCP tool definition returned by `tools/list`.
@@ -502,11 +749,26 @@ where
     }
 }
 
+/// Drain a captured child stderr pipe into the bounded tail buffer.
+/// Runs until EOF (child exit closes the pipe); never fails the client.
+async fn stderr_drain_loop(mut stderr: ChildStderr, tail: StderrTail) {
+    let mut chunk = vec![0u8; 4096];
+    loop {
+        match stderr.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => tail.push_bytes(&chunk[..n]),
+            Err(_) => break,
+        }
+    }
+    tail.mark_eof();
+}
+
 async fn writer_loop(
     mut stdin: ChildStdin,
     mut receiver: mpsc::Receiver<WriteCommand>,
     pending: PendingMap,
     transport_open: Arc<AtomicBool>,
+    stderr_tail: Option<StderrTail>,
 ) {
     while let Some(command) = receiver.recv().await {
         let result = timeout_at(command.deadline, async {
@@ -530,14 +792,20 @@ async fn writer_loop(
             Err(_) => "MCP transport writer timed out while writing a frame".to_string(),
         };
 
+        let error = with_tail_suffix(anyhow!(error), &collect_stderr_tail(&stderr_tail).await);
         transport_open.store(false, Ordering::SeqCst);
-        let _ = command.completion.send(Err(anyhow!(error.clone())));
-        fail_pending(&pending, &error).await;
+        let _ = command.completion.send(Err(anyhow!("{error:#}")));
+        fail_pending(&pending, &format!("{error:#}")).await;
         return;
     }
 
     transport_open.store(false, Ordering::SeqCst);
-    fail_pending(&pending, "MCP transport writer closed").await;
+    let tail = collect_stderr_tail(&stderr_tail).await;
+    let closed = format!(
+        "{:#}",
+        with_tail_suffix(anyhow!("MCP transport writer closed"), &tail)
+    );
+    fail_pending(&pending, &closed).await;
 }
 
 async fn reader_loop(
@@ -546,6 +814,7 @@ async fn reader_loop(
     writer: mpsc::WeakSender<WriteCommand>,
     transport_open: Arc<AtomicBool>,
     write_timeout: Duration,
+    stderr_tail: Option<StderrTail>,
 ) {
     let mut reader = BufReader::new(stdout);
     let mut line = Vec::new();
@@ -562,12 +831,21 @@ async fn reader_loop(
             }
             Ok(None) => {
                 transport_open.store(false, Ordering::SeqCst);
-                fail_pending(&pending, "MCP server stdout closed").await;
+                let tail = collect_stderr_tail(&stderr_tail).await;
+                let message = format!(
+                    "{:#}",
+                    with_tail_suffix(anyhow!("MCP server stdout closed"), &tail)
+                );
+                fail_pending(&pending, &message).await;
                 return;
             }
             Err(err) => {
                 transport_open.store(false, Ordering::SeqCst);
-                let message = format!("failed to read MCP server stdout: {err:#}");
+                let tail = collect_stderr_tail(&stderr_tail).await;
+                let message = format!(
+                    "{:#}",
+                    with_tail_suffix(anyhow!("failed to read MCP server stdout: {err:#}"), &tail)
+                );
                 fail_pending(&pending, &message).await;
                 return;
             }
@@ -1009,6 +1287,7 @@ mod tests {
             writer_receiver,
             Arc::clone(&pending),
             Arc::clone(&transport_open),
+            None,
         ));
         let reader_task = tokio::spawn(reader_loop(
             stdout,
@@ -1016,6 +1295,7 @@ mod tests {
             writer.downgrade(),
             Arc::clone(&transport_open),
             Duration::from_secs(30),
+            None,
         ));
         let client = McpStdioClient {
             child: Mutex::new(child),
@@ -1024,6 +1304,8 @@ mod tests {
             transport_open,
             writer_task,
             reader_task,
+            stderr_task: None,
+            stderr_tail: None,
             next_id: AtomicU64::new(1),
             options: McpStdioClientOptions {
                 shutdown_grace_period: Duration::from_millis(25),
@@ -1092,6 +1374,35 @@ mod tests {
         let line = read_capped_line(&mut reader, &mut buffer).await.unwrap();
 
         assert_eq!(line.as_deref(), Some(r#"{"jsonrpc":"2.0"}"#));
+    }
+
+    #[test]
+    fn stderr_ring_keeps_most_recent_bytes_and_clamps() {
+        let tail = StderrState::new(8);
+        tail.push_bytes(b"hello world");
+        assert_eq!(tail.tail_string(), "lo world");
+
+        assert_eq!(
+            StderrPolicy::capture().max_bytes_for_test(),
+            DEFAULT_STDERR_CAP_BYTES
+        );
+        assert_eq!(
+            StderrPolicy::capture_with_max_bytes(usize::MAX).max_bytes_for_test(),
+            MAX_STDERR_CAP_BYTES
+        );
+
+        // cap == 0 discards without growing the buffer.
+        let empty = StderrState::new(0);
+        empty.push_bytes(b"discarded");
+        assert_eq!(empty.tail_string(), "");
+        // Invalid UTF-8 renders lossy rather than failing.
+        empty.mark_eof();
+        let utf = StderrState::new(4);
+        utf.push_bytes(&[0xff, 0xfe, b'a', b'b']);
+        assert!(utf.tail_string().contains('a'));
+
+        let (bytes, eof) = empty.snapshot();
+        assert!(bytes.is_empty() && eof);
     }
 
     #[tokio::test]
