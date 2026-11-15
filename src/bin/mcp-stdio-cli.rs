@@ -126,11 +126,24 @@ fn split_command(input: &str) -> Result<Vec<String>> {
             }
             (None, '\'' | '"') => quote = Some(ch),
             (Some(active), ch) if ch == active => quote = None,
-            (_, '\\') => {
-                if let Some(next) = chars.next() {
-                    current.push(next);
+            (Some('\''), _) => current.push(ch),
+            (_, '\\') => match chars.peek() {
+                None => {}
+                Some(&next) => {
+                    let escapable = match quote {
+                        None => true,
+                        Some('"') => matches!(next, '"' | '\\' | '$'),
+                        // Single quotes handled above; other states push literally.
+                        _ => false,
+                    };
+                    if escapable {
+                        chars.next();
+                        current.push(next);
+                    } else {
+                        current.push(ch);
+                    }
                 }
-            }
+            },
             _ => current.push(ch),
         }
     }
@@ -143,4 +156,40 @@ fn split_command(input: &str) -> Result<Vec<String>> {
     }
 
     Ok(parts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_command;
+
+    #[test]
+    fn backslash_is_literal_inside_single_quotes() {
+        assert_eq!(
+            split_command("sh -c 'echo \\n'").unwrap(),
+            vec!["sh", "-c", "echo \\n"]
+        );
+    }
+
+    #[test]
+    fn double_quote_escapes_preserved() {
+        assert_eq!(
+            split_command("cmd \"a\\\"b\"").unwrap(),
+            vec!["cmd", "a\"b"]
+        );
+        assert_eq!(
+            split_command("cmd \"a\\\\b\"").unwrap(),
+            vec!["cmd", "a\\b"]
+        );
+        // Backslash before ordinary chars inside double quotes stays literal.
+        assert_eq!(
+            split_command("cmd \"a\\nb\"").unwrap(),
+            vec!["cmd", "a\\nb"]
+        );
+    }
+
+    #[test]
+    fn unterminated_quotes_are_errors() {
+        assert!(split_command("cmd 'abc").is_err());
+        assert!(split_command("cmd \"abc").is_err());
+    }
 }
