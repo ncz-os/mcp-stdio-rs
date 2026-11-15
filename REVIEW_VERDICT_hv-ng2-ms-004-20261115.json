@@ -1,0 +1,33 @@
+{
+  "reviewed_job_id": "01a1dd81-2a2b-7055-83be-bccc65e3cb31",
+  "branch": "hv/ng2-ms-004-20261115",
+  "head_sha": "c13ac3173d7bba6e9903afabd5705abc88774e3c",
+  "base": "origin/master (merge-base 4324c25645d54e48e4690c5473937922e6c6e9f4)",
+  "reviewed_at": "2026-11-15T08:05:00-05:00",
+  "re_review": true,
+  "re_review_note": "Re-review. Prior evidence was delivered at an older head (8291e1f); this review independently re-inspects the full diff at the current head c13ac3173d7bba6e9903afabd5705abc88774e3c against master. The branch contains exactly one commit on top of master: c13ac31 'feat(mcp-stdio-rs): capture child stderr tail on transport-closed errors'.",
+  "verdict": "approve",
+  "reason": "The change implements StderrPolicy (Inherit default | Capture with 8 KiB default / 1 MiB clamp), a bounded VecDeque-backed ring, an EOF-signalled drain task, and appends the captured tail to transport-closed, request-failure, initialize-failure, and writer-closed error paths. Default behaviour is preserved (Inherit). The ring caps memory (chatty children never block because cap==0 discards and the pipe is always drained); drain/shutdown loops are bounded (STDERR_EOF_WAIT 250 ms, timeout + abort handle on join expiry). Tests exercise the new behaviour end-to-end via a fail-stderr fixture server. No secrets added, no swallowed errors (write/reader loop failures still propagate; only sender-drop is ignored), no unbounded loop or I/O, and no weakened checks. Build, clippy, and full test suite pass at this head.",
+  "evidence": [
+    "git merge-base origin/master HEAD = 4324c25645d54e48e4690c5473937922e6c6e9f4; git log origin/master..HEAD = exactly one commit c13ac3173d7bba6e9903afabd5705abc88774e3c",
+    "src/lib.rs:26-27 DEFAULT_STDERR_CAP_BYTES=8*1024, MAX_STDERR_CAP_BYTES=1024*1024 (hard clamp)",
+    "src/lib.rs:34-51 StderrPolicy::capture_with_max_bytes clamps via max_bytes.min(MAX_STDERR_CAP_BYTES); Default impl at src/lib.rs:53-57 returns Inherit",
+    "src/lib.rs:100-155 StderrBuffer/push_bytes: VecDeque with per-byte pop_front/push_back; cap==0 returns immediately (drain never blocks)",
+    "src/lib.rs:233-241 command.stderr(Stdio::piped()) only for Capture; Inherit keeps Stdio::inherit() — backward-compatible",
+    "src/lib.rs:749-760 stderr_drain_loop reads 4 KiB chunks until Ok(0) or Err, then tail.mark_eof(); bounded, never fails client",
+    "src/lib.rs:612-634 collect_stderr_tail: loop with Instant deadline of STDERR_EOF_WAIT (250 ms, src/lib.rs:28); breaks on eof or remaining.is_zero(); not an unbounded loop",
+    "src/lib.rs:486-501 shutdown joins stderr_task with timeout(options.shutdown_grace_period, ...) then abort.abort() on expiry — bounded wait, no leaked pipe",
+    "src/lib.rs:309-312 spawn_with_options applies with_stderr_tail to initialize failures",
+    "src/lib.rs:521-540 send_request: closed-transport error and 'server closed before responding' both get collect_stderr_tail + with_tail_suffix",
+    "src/lib.rs:792-808 writer_loop applies tail to write-timeout, completion error, and writer-closed messages (fail_pending at src/lib.rs:1023 receives message string)",
+    "src/lib.rs:831-847 reader_loop applies tail to stdout-closed and read-error messages",
+    "tests/fixtures/synthetic_mcp_server.py:11-14 fail-stderr mode prints 'boom: missing token' to stderr then sys.exit(1)",
+    "tests/integration_smoke.rs:329-353 failing_server_stderr_tail_is_attached_to_initialize_error asserts error contains 'boom: missing token' under StderrPolicy::capture()",
+    "tests/integration_smoke.rs:355-367 stderr_inherit_is_the_default_and_captures_nothing asserts default is Inherit and stderr_tail() is empty",
+    "tests/integration_smoke.rs:370-398 stderr_capture_ring_is_bounded asserts 16-byte ring keeps only 'missing token' (tail truncation verified)",
+    "src/lib.rs unit test stderr_ring_keeps_most_recent_bytes_and_clamps (src/lib.rs ~1376-1406) verifies 8-byte ring keeps 'lo world', 1 MiB clamp, cap==0 discards, lossy UTF-8, and eof snapshot",
+    "cargo build --all-targets: success; cargo clippy --all-targets: no warnings; cargo test: 11 unit + 16 integration all pass at head c13ac31 (no failures, no panics)",
+    "No secrets/tokens added (fixture message is generic 'boom: missing token'); no swallowed errors — drain read errors break and are represented by EOF; only oneshot sender drops use ignored 'let _' (correct for dropped receivers)"
+  ],
+  "defects": []
+}
