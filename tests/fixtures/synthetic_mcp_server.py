@@ -143,7 +143,7 @@ for line in sys.stdin:
                         },
                     },
                 ],
-                "isError": False,
+                "isError": text == "error",
             },
             request_id,
         )

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
-use mcp_stdio_rs::{ContentBlock, McpStdioClient};
+use mcp_stdio_rs::{ContentBlock, McpStdioClient, ToolResult};
 use serde_json::Value;
 
 #[derive(Debug, Parser)]
@@ -61,9 +61,12 @@ async fn main() -> Result<()> {
             let args_json: Value =
                 serde_json::from_str(&args).context("failed to parse --args as JSON")?;
             let client = spawn_from_command_string(&cmd).await?;
-            let operation = async {
-                let result = client.call_tool(&name, args_json).await?;
+            // The child exits 3 when a tool reports isError=true, so scripts can
+            // distinguish a failed tool call from a successful one.
+            let operation: Result<bool, anyhow::Error> = async {
+                let result: ToolResult = client.call_tool(&name, args_json).await?;
                 println!("is_error: {}", result.is_error);
+                let is_error = result.is_error;
                 for block in result.content {
                     match block {
                         ContentBlock::Text(text) => println!("{text}"),
@@ -89,12 +92,21 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                Ok::<_, anyhow::Error>(())
+                Ok(is_error)
             }
             .await;
-            let shutdown = client.shutdown().await;
-            operation?;
-            shutdown?;
+            let shutdown = client.shutdown();
+            let is_error = match operation {
+                Ok(is_error) => is_error,
+                Err(error) => {
+                    let _shutdown = shutdown.await;
+                    return Err(error);
+                }
+            };
+            shutdown.await?;
+            if is_error {
+                std::process::exit(3);
+            }
         }
     }
 
