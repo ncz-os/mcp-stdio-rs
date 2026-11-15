@@ -19,6 +19,10 @@ for line in sys.stdin:
     request_id = request.get("id")
 
     if method == "initialize":
+        sink = os.environ.get("MCP_STDIO_CLIENT_INFO_SINK")
+        if sink:
+            with open(sink, "w") as handle:
+                json.dump(request.get("params", {}).get("clientInfo", {}), handle)
         if mode == "stall-initialize":
             continue
         send(

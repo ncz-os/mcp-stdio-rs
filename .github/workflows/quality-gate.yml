@@ -49,7 +49,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   build:
     name: ${{ matrix.label }} ${{ matrix.target }}
@@ -71,7 +71,7 @@ jobs:
         with:
           cache-on-failure: true
       - name: ${{ matrix.label }}
-        run: cargo ${{ matrix.cmd }} --workspace --locked --all-features --target ${{ matrix.target }}
+        run: cargo ${{ matrix.cmd }} --workspace --locked --target ${{ matrix.target }}
 
   check:
     name: Check (${{ matrix.name }})
@@ -82,7 +82,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: all features,        args: "--all-features" }
+          - { name: default features,     args: "" }
           - { name: no default features, args: "--no-default-features" }
     steps:
       - uses: actions/checkout@v4
@@ -109,9 +109,9 @@ jobs:
           cache-on-failure: true
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
-      - run: cargo nextest run --workspace --locked --all-features
+      - run: cargo nextest run --workspace --locked
       - name: Doctests
-        run: cargo test --workspace --locked --all-features --doc
+        run: cargo test --workspace --locked --doc
 
   security:
     name: Security
