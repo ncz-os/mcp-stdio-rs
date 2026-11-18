@@ -24,7 +24,7 @@ cargo add mcp-stdio-rs
 - `client.list_tools()` returns the server's available `ToolDef` values.
 - `client.call_tool(name, args)` sends `tools/call` with JSON arguments and returns `ToolResult`.
 - `client.stderr_tail()` returns the captured child stderr tail (empty unless `StderrPolicy::capture` was selected; the tail is also appended to transport-closed errors).
-- `client.shutdown()` sends a best-effort shutdown, kills the child process if needed, and joins the stdout reader task.
+- `client.shutdown()` closes the child's stdin, waits `shutdown_grace_period` for it to exit, then sends SIGTERM and waits again before force-killing it, and joins the stdout reader task.
 
 ## Example
 

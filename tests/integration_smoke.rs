@@ -405,6 +405,72 @@ async fn stderr_capture_ring_is_bounded() {
     );
 }
 
+#[test]
+fn cli_call_exits_3_when_tool_result_is_error() {
+    let current_exe = std::env::current_exe().expect("current executable path");
+    let manifest_dir = current_exe
+        .parent()
+        .expect("deps directory")
+        .parent()
+        .expect("debug directory")
+        .parent()
+        .expect("target directory")
+        .parent()
+        .expect("manifest directory");
+    let debug_dir = current_exe
+        .parent()
+        .expect("deps directory")
+        .parent()
+        .expect("debug directory");
+    let cli = debug_dir.join("mcp-stdio-cli");
+    let python = manifest_dir.join("tests/fixtures/synthetic_mcp_server.py");
+
+    // The synthetic server's tools/call handler replies `true` to isError
+    // whenever the msg argument is "error".
+    let server_cmd = format!("python3 -u '{}'", python.to_string_lossy());
+    let call = |msg: &str| {
+        std::process::Command::new(&cli)
+            .args([
+                "call",
+                "--cmd",
+                &server_cmd,
+                "--name",
+                "echo",
+                "--args",
+                msg,
+            ])
+            .env("MCP_STDIO_SMOKE_SERVER", "cli-exit-code")
+            .output()
+            .expect("run mcp-stdio-cli")
+    };
+
+    let success = call(r#"{"msg": "ok"}"#);
+    assert_eq!(
+        success.status.code(),
+        Some(0),
+        "successful tool must exit 0"
+    );
+    assert!(
+        success.stdout.starts_with(b"is_error: false\nok"),
+        "success stdout: {:?}",
+        String::from_utf8_lossy(&success.stdout)
+    );
+
+    let failure = call(r#"{"msg": "error"}"#);
+    assert_eq!(
+        failure.status.code(),
+        Some(3),
+        "tool result with isError=true must exit 3; stdout: {:?} stderr: {:?}",
+        String::from_utf8_lossy(&failure.stdout),
+        String::from_utf8_lossy(&failure.stderr)
+    );
+    assert!(
+        failure.stdout.starts_with(b"is_error: true\nerror"),
+        "error stdout: {:?}",
+        String::from_utf8_lossy(&failure.stdout)
+    );
+}
+
 fn synthetic_server_command() -> (&'static str, [&'static str; 2]) {
     (
         "python3",

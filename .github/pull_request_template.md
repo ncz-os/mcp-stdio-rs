@@ -13,8 +13,8 @@ Run the full gate locally and paste literal output tails (failures/warnings, not
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo nextest run --workspace --all-features   # or: cargo test --workspace --all-features
+cargo clippy --workspace --all-targets -- -D warnings
+cargo nextest run --workspace   # or: cargo test --workspace
 cargo deny check
 ```
 

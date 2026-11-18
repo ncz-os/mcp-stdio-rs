@@ -293,7 +293,7 @@ impl McpStdioClient {
             "capabilities": {},
             "clientInfo": {
                 "name": "mcp-stdio-rs",
-                "version": "0.1.0"
+                "version": env!("CARGO_PKG_VERSION")
             }
         });
 

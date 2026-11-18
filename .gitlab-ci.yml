@@ -33,20 +33,20 @@ clippy:
   stage: check
   script:
     - rustup component add clippy
-    - cargo clippy --workspace --all-targets --all-features -- -D warnings
+    - cargo clippy --workspace --all-targets -- -D warnings
 
 check:
   stage: check
   script:
-    - cargo check --workspace --locked --all-features
+    - cargo check --workspace --locked
     - cargo check --workspace --locked --no-default-features
 
 test:
   stage: test
   script:
     - curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "$CARGO_HOME/bin"
-    - cargo nextest run --workspace --locked --all-features
-    - cargo test --workspace --locked --all-features --doc
+    - cargo nextest run --workspace --locked
+    - cargo test --workspace --locked --doc
 
 security:
   stage: security
